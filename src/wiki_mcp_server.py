@@ -101,6 +101,38 @@ class WikiJSClient:
         self.base_url = settings.WIKIJS_API_URL.rstrip('/')
         self.client = httpx.AsyncClient(timeout=30.0)
         self.authenticated = False
+
+    def _parse_json_response(self, response: httpx.Response) -> Dict:
+        """Parse JSON, including Brotli-compressed responses when needed."""
+        try:
+            return response.json()
+        except UnicodeDecodeError as exc:
+            content_encoding = response.headers.get("content-encoding", "")
+            encodings = {
+                encoding.strip().lower()
+                for encoding in content_encoding.split(",")
+                if encoding.strip()
+            }
+
+            if "br" not in encodings:
+                raise
+
+            try:
+                import brotli
+            except ImportError as import_error:
+                raise Exception(
+                    "Wiki.js returned a Brotli-compressed response, but Brotli "
+                    "support is not installed. Run ./setup.sh to install the "
+                    "updated dependencies."
+                ) from import_error
+
+            try:
+                decompressed = brotli.decompress(response.content)
+                return json.loads(decompressed.decode(response.encoding or "utf-8"))
+            except Exception as decode_error:
+                raise Exception(
+                    "Failed to decode Brotli-compressed Wiki.js response"
+                ) from decode_error
         
     async def authenticate(self) -> bool:
         """Set up authentication headers for GraphQL requests."""
@@ -160,7 +192,7 @@ class WikiJSClient:
             response = await self.client.post(url, json=payload)
             response.raise_for_status()
             
-            data = response.json()
+            data = self._parse_json_response(response)
             
             # Check for GraphQL errors
             if "errors" in data:
