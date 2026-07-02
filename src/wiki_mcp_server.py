@@ -210,6 +210,54 @@ class WikiJSClient:
 # Initialize client
 wikijs = WikiJSClient()
 
+async def create_wikijs_page_at_path(title: str, content: str, path: str) -> Dict[str, Any]:
+    """Create a Wiki.js page at an explicit path."""
+    mutation = """
+    mutation($content: String!, $description: String!, $editor: String!, $isPublished: Boolean!, $isPrivate: Boolean!, $locale: String!, $path: String!, $publishEndDate: Date, $publishStartDate: Date, $scriptCss: String, $scriptJs: String, $tags: [String]!, $title: String!) {
+        pages {
+            create(content: $content, description: $description, editor: $editor, isPublished: $isPublished, isPrivate: $isPrivate, locale: $locale, path: $path, publishEndDate: $publishEndDate, publishStartDate: $publishStartDate, scriptCss: $scriptCss, scriptJs: $scriptJs, tags: $tags, title: $title) {
+                responseResult {
+                    succeeded
+                    errorCode
+                    slug
+                    message
+                }
+                page {
+                    id
+                    path
+                    title
+                }
+            }
+        }
+    }
+    """
+
+    variables = {
+        "content": content,
+        "description": "",
+        "editor": "markdown",
+        "isPublished": True,
+        "isPrivate": False,
+        "locale": "en",
+        "path": path.strip("/"),
+        "publishEndDate": None,
+        "publishStartDate": None,
+        "scriptCss": "",
+        "scriptJs": "",
+        "tags": [],
+        "title": title
+    }
+
+    response = await wikijs.graphql_request(mutation, variables)
+    create_result = response.get("data", {}).get("pages", {}).get("create", {})
+    response_result = create_result.get("responseResult", {})
+
+    if response_result.get("succeeded"):
+        return create_result.get("page", {})
+
+    error_msg = response_result.get("message", "Unknown error")
+    raise Exception(f"Failed to create page: {error_msg}")
+
 def get_db():
     """Get database session."""
     db = SessionLocal()
@@ -293,7 +341,7 @@ def extract_code_structure(file_path: str) -> Dict[str, Any]:
 # MCP Tools Implementation
 
 @mcp.tool()
-async def wikijs_create_page(title: str, content: str, space_id: str = "", parent_id: str = "") -> str:
+async def wikijs_create_page(title: str, content: str, space_id: str = "", parent_id: str = "", path: str = "") -> str:
     """
     Create a new page in Wiki.js with support for hierarchical organization.
     
@@ -302,6 +350,7 @@ async def wikijs_create_page(title: str, content: str, space_id: str = "", paren
         content: Page content (markdown or HTML)
         space_id: Space ID (optional, uses default if not provided)
         parent_id: Parent page ID for hierarchical organization (optional)
+        path: Explicit page path (optional, overrides generated path)
     
     Returns:
         JSON string with page details: {'pageId': int, 'url': str}
@@ -309,8 +358,11 @@ async def wikijs_create_page(title: str, content: str, space_id: str = "", paren
     try:
         await wikijs.authenticate()
         
-        # Generate path - if parent_id provided, create nested path
-        if parent_id:
+        # Generate path - if parent_id provided, create nested path.
+        # Explicit paths support Wiki.js virtual hierarchy containers.
+        if path:
+            page_path = path.strip("/")
+        elif parent_id:
             # Get parent page to build nested path
             parent_query = """
             query($id: Int!) {
@@ -328,69 +380,23 @@ async def wikijs_create_page(title: str, content: str, space_id: str = "", paren
             if parent_data:
                 parent_path = parent_data["path"]
                 # Create nested path: parent-path/child-title
-                path = f"{parent_path}/{slugify(title)}"
+                page_path = f"{parent_path}/{slugify(title)}"
             else:
-                path = slugify(title)
+                page_path = slugify(title)
         else:
-            path = slugify(title)
-        
-        # GraphQL mutation to create a page
-        mutation = """
-        mutation($content: String!, $description: String!, $editor: String!, $isPublished: Boolean!, $isPrivate: Boolean!, $locale: String!, $path: String!, $publishEndDate: Date, $publishStartDate: Date, $scriptCss: String, $scriptJs: String, $tags: [String]!, $title: String!) {
-            pages {
-                create(content: $content, description: $description, editor: $editor, isPublished: $isPublished, isPrivate: $isPrivate, locale: $locale, path: $path, publishEndDate: $publishEndDate, publishStartDate: $publishStartDate, scriptCss: $scriptCss, scriptJs: $scriptJs, tags: $tags, title: $title) {
-                    responseResult {
-                        succeeded
-                        errorCode
-                        slug
-                        message
-                    }
-                    page {
-                        id
-                        path
-                        title
-                    }
-                }
-            }
+            page_path = slugify(title)
+
+        page_data = await create_wikijs_page_at_path(title, content, page_path)
+        result = {
+            "pageId": page_data.get("id"),
+            "url": page_data.get("path"),
+            "title": page_data.get("title"),
+            "status": "created",
+            "parentId": int(parent_id) if parent_id else None,
+            "hierarchicalPath": page_path
         }
-        """
-        
-        variables = {
-            "content": content,
-            "description": "",
-            "editor": "markdown",
-            "isPublished": True,
-            "isPrivate": False,
-            "locale": "en",
-            "path": path,
-            "publishEndDate": None,
-            "publishStartDate": None,
-            "scriptCss": "",
-            "scriptJs": "",
-            "tags": [],
-            "title": title
-        }
-        
-        response = await wikijs.graphql_request(mutation, variables)
-        
-        create_result = response.get("data", {}).get("pages", {}).get("create", {})
-        response_result = create_result.get("responseResult", {})
-        
-        if response_result.get("succeeded"):
-            page_data = create_result.get("page", {})
-            result = {
-                "pageId": page_data.get("id"),
-                "url": page_data.get("path"),
-                "title": page_data.get("title"),
-                "status": "created",
-                "parentId": int(parent_id) if parent_id else None,
-                "hierarchicalPath": path
-            }
-            logger.info(f"Created page: {title} (ID: {result['pageId']}) at path: {path}")
-            return json.dumps(result)
-        else:
-            error_msg = response_result.get("message", "Unknown error")
-            return json.dumps({"error": f"Failed to create page: {error_msg}"})
+        logger.info(f"Created page: {title} (ID: {result['pageId']}) at path: {page_path}")
+        return json.dumps(result)
         
     except Exception as e:
         error_msg = f"Failed to create page '{title}': {str(e)}"
@@ -1271,83 +1277,26 @@ async def wikijs_create_nested_page(title: str, content: str, parent_path: str, 
         title: Page title
         content: Page content
         parent_path: Full path to parent (e.g., "my-repo/api")
-        create_parent_if_missing: Create parent pages if they don't exist
+        create_parent_if_missing: Kept for compatibility. Wiki.js supports
+            virtual parent paths, so missing parent pages are not materialized.
     
     Returns:
         JSON string with page details
     """
     try:
         await wikijs.authenticate()
-        
-        # Check if parent exists
-        parent_query = """
-        query($path: String!) {
-            pages {
-                singleByPath(path: $path, locale: "en") {
-                    id
-                    path
-                    title
-                }
-            }
-        }
-        """
-        
-        parent_response = await wikijs.graphql_request(parent_query, {"path": parent_path})
-        parent_data = parent_response.get("data", {}).get("pages", {}).get("singleByPath")
-        
-        if not parent_data and create_parent_if_missing:
-            # Create parent structure
-            path_parts = parent_path.split("/")
-            current_path = ""
-            parent_id = None
-            
-            for i, part in enumerate(path_parts):
-                if current_path:
-                    current_path += f"/{part}"
-                else:
-                    current_path = part
-                
-                # Check if this level exists
-                check_response = await wikijs.graphql_request(parent_query, {"path": current_path})
-                existing = check_response.get("data", {}).get("pages", {}).get("singleByPath")
-                
-                if not existing:
-                    # Create this level
-                    part_title = part.replace("-", " ").title()
-                    part_content = f"""# {part_title}
 
-This is a section page for organizing documentation.
+        full_path = f"{parent_path.strip('/')}/{title.strip()}".strip("/")
 
-## Subsections
-
-*Subsections will appear here as they are created.*
-
----
-*This page was auto-created as part of the documentation hierarchy.*
-"""
-                    
-                    create_result = await wikijs_create_page(part_title, part_content, parent_id=str(parent_id) if parent_id else "")
-                    create_data = json.loads(create_result)
-                    
-                    if "error" not in create_data:
-                        parent_id = create_data["pageId"]
-                    else:
-                        return json.dumps({"error": f"Failed to create parent '{current_path}': {create_data['error']}"})
-                else:
-                    parent_id = existing["id"]
-        
-        elif parent_data:
-            parent_id = parent_data["id"]
-        else:
-            return json.dumps({"error": f"Parent path '{parent_path}' not found and create_parent_if_missing is False"})
-        
-        # Create the target page
-        result = await wikijs_create_page(title, content, parent_id=str(parent_id))
+        # Create the target page at the explicit path. Wiki.js supports virtual
+        # hierarchy containers, so parent_path does not need to be a real page.
+        result = await wikijs_create_page(title, content, path=full_path)
         result_data = json.loads(result)
         
         if "error" not in result_data:
             result_data["parent_path"] = parent_path
-            result_data["full_path"] = f"{parent_path}/{slugify(title)}"
+            result_data["full_path"] = full_path
+            result_data["created_parent_pages"] = False
         
         return json.dumps(result_data)
         
