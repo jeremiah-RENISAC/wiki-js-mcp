@@ -1,6 +1,6 @@
 # Wiki.js MCP Server
 
-A comprehensive **Model Context Protocol (MCP) server** for Wiki.js integration with **hierarchical documentation** support and Docker deployment. Perfect for organizations managing multiple repositories and large-scale documentation.
+A comprehensive **Model Context Protocol (MCP) server** for Wiki.js integration with **hierarchical documentation** support. Perfect for organizations managing multiple repositories and large-scale documentation.
 
 ## 🚀 Quick Start
 
@@ -12,21 +12,11 @@ First, clone this repository and set up environment variables:
 cp config/example.env .env
 
 # Edit .env with your credentials:
-# - Set POSTGRES_PASSWORD to a secure password
-# - Update other settings as needed
+# - Set WIKIJS_API_URL to your Wiki.js instance
+# - Set WIKIJS_TOKEN to your Wiki.js API key
 ```
 
-### 2. Docker Deployment (Recommended)
-
-```bash
-# Start Wiki.js with Docker
-docker-compose -f docker.yml up -d
-```
-Wiki.js will be available at http://localhost:3000
-
-Complete the initial setup in the web interface
-
-### 3. Setup MCP Server
+### 2. Setup MCP Server
 ```bash
 # Install Python dependencies
 ./setup.sh
@@ -38,29 +28,29 @@ Complete the initial setup in the web interface
 # Test the connection
 ./test-server.sh
 
-# Start MCP server
-# (not needed for AI IDEs like Cursor, simply click on the refresh icon after editing mcp.json
-# and you should see a green dot with all tools listed. In existing open Cursor windows,
-# this refresh is necessary in order to use this MCP)
+# Start MCP server manually only when debugging.
+# Codex starts this script automatically after you configure the MCP server.
 ./start-server.sh
 ```
 
-### 4. Configure Cursor MCP
-Add to your `~/.cursor/mcp.json`:
-```json
-{
-  "mcpServers": {
-    "wikijs": {
-      "command": "/path/to/wiki-js-mcp/start-server.sh"
-    }
-  }
-}
+### 3. Configure Codex MCP
+
+Codex stores MCP servers in `config.toml`. Add this to `~/.codex/config.toml`, or to `.codex/config.toml` inside a trusted project if you want the Wiki.js server scoped to that project:
+
+```toml
+[mcp_servers.wikijs]
+command = "/absolute/path/to/wiki-js-mcp/start-server.sh"
+cwd = "/absolute/path/to/wiki-js-mcp"
+startup_timeout_sec = 20
+tool_timeout_sec = 60
 ```
 
-## 🎯 Enhanced Cursor Integration
+Restart Codex or start a new session after updating the config. In the Codex CLI/TUI, run `/mcp` to verify that the `wikijs` server is active.
 
-### Global Rules for Documentation-First Development
-Add these **Global Rules** in Cursor to automatically leverage documentation before coding:
+## 🎯 Enhanced Codex Integration
+
+### AGENTS.md Guidance for Documentation-First Development
+Add this guidance to `~/.codex/AGENTS.md` for a global default, or to an `AGENTS.md` file in a repository where this workflow should apply:
 
 ```
 Before writing any code, always:
@@ -72,14 +62,14 @@ Before writing any code, always:
 6. For new features, use wikijs_create_repo_structure to plan the documentation hierarchy first
 ```
 
-These rules ensure that your AI assistant will:
+This guidance helps Codex:
 - ✅ Check documentation before suggesting implementations
 - ✅ Follow existing patterns and conventions
 - ✅ Maintain up-to-date documentation automatically
 - ✅ Create structured documentation for new features
 - ✅ Avoid duplicating existing functionality
 
-### Usage Tips for Cursor
+### Usage Tips for Codex
 ```
 # Before starting a new feature
 "Search the documentation for authentication patterns before implementing login"
@@ -108,12 +98,6 @@ These rules ensure that your AI assistant will:
 - **Code structure analysis**: Extract classes, functions, and dependencies
 - **Bulk operations**: Update multiple pages simultaneously
 - **Change tracking**: Monitor file modifications and sync docs
-
-### 🐳 **Docker Setup**
-- **One-command deployment**: Complete Wiki.js setup with PostgreSQL
-- **Persistent storage**: Data survives container restarts
-- **Health checks**: Automatic service monitoring
-- **Production-ready**: Optimized for development and deployment
 
 ### 🔍 **Smart Features**
 - **Repository context detection**: Auto-detect Git repositories
@@ -257,18 +241,9 @@ await wikijs_cleanup_orphaned_mappings()
 
 ### Environment Variables
 ```bash
-# Docker Database Configuration
-POSTGRES_DB=wikijs
-POSTGRES_USER=wikijs
-POSTGRES_PASSWORD=your_secure_password_here
-
 # Wiki.js Connection
-WIKIJS_API_URL=http://localhost:3000
-WIKIJS_API_KEY=your_jwt_token_here
-
-# Alternative: Username/Password
-WIKIJS_USERNAME=your_username
-WIKIJS_PASSWORD=your_password
+WIKIJS_API_URL=https://your-wiki.example.com
+WIKIJS_TOKEN=your_api_key_here
 
 # Database & Logging
 WIKIJS_MCP_DB=./wikijs_mappings.db
@@ -320,7 +295,6 @@ wiki-js-mcp/
 │   └── wiki_mcp_server.py      # Main MCP server implementation
 ├── config/
 │   └── example.env             # Configuration template
-├── docker.yml                  # Docker Compose setup
 ├── pyproject.toml              # Poetry dependencies
 ├── requirements.txt            # Pip dependencies
 ├── setup.sh                    # Environment setup script
@@ -341,24 +315,10 @@ wiki-js-mcp/
 
 ## 🔍 Troubleshooting
 
-### Docker Issues
-```bash
-# Check containers
-docker-compose -f docker.yml ps
-
-# View logs
-docker-compose -f docker.yml logs wiki
-docker-compose -f docker.yml logs postgres
-
-# Reset everything
-docker-compose -f docker.yml down -v
-docker-compose -f docker.yml up -d
-```
-
 ### Connection Issues
 ```bash
-# Check Wiki.js is running
-curl http://localhost:3000/graphql
+# Check Wiki.js is reachable
+curl "$WIKIJS_API_URL/graphql"
 
 # Verify authentication
 ./test-server.sh
@@ -369,9 +329,7 @@ export LOG_LEVEL=DEBUG
 ```
 
 ### Common Problems
-- **Port conflicts**: Change port 3000 in `docker.yml` if needed
-- **Database issues**: Remove `postgres_data/` and restart
-- **API permissions**: Ensure API key has admin privileges
+- **API permissions**: Ensure the API key has the Wiki.js permissions required for the tools you use
 - **Python dependencies**: Run `./setup.sh` to reinstall
 
 ## 📚 Documentation
@@ -400,4 +358,4 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ---
 
-**Ready to scale your documentation?** 🚀 Start with `wikijs_create_repo_structure` and build enterprise-grade documentation hierarchies! Use the Cursor global rules to ensure documentation-first development! 📚✨ 
+**Ready to scale your documentation?** 🚀 Start with `wikijs_create_repo_structure` and build enterprise-grade documentation hierarchies! Use Codex guidance to ensure documentation-first development! 📚✨ 
