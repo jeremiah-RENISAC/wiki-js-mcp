@@ -56,12 +56,17 @@ Add this guidance to `~/.codex/AGENTS.md` for a global default, or to an `AGENTS
 # ~/.codex/AGENTS.md
 
 ## WikiJS MCP usage
-- Use WikiJS only when work depends on internal context: services, environments, deployments, operations, alerts, runbooks, ownership, or internal conventions. Use repository files for current code behavior and public/vendor docs for external APIs, frameworks, packages, and advisories.
-- Before making environment-dependent or operational changes, search WikiJS with relevant project, service, alert, environment, acronym, owner, and runbook terms. Prefer specific service, SOP, alert, runbook, incident, or architecture pages over broad overview pages.
+- Use WikiJS only when work depends on internal context: services, environments, deployments, operations, playbooks, conventions. Use repository files for current code behavior. Use public/vendor docs for external APIs, frameworks, packages, and advisories.
+- Before environment-dependent or operational changes, search WikiJS with relevant project, component, procedure, alert, symptom, environment, etc.
+- Prefer pages with this structure when available:
+  - `About`: high-level service overview, ownership, links, environments, architecture.
+  - `Procedures`: planned, repeatable work while the system is healthy.
+  - `Response`: alerts, incidents, symptoms, known errors, and unplanned investigation.
 - Treat WikiJS as internal context that may be stale. If WikiJS conflicts with the repo, observed behavior, or public/vendor docs, rely on the source that owns that fact and mention the conflict.
-- Write to WikiJS only when documenting standard processes, runbooks, or alert response guidance; only after user approval unless explicitly asked; and only under paths explicitly approved for write access.
-- When writing, be factual, concise, and operational. Update existing pages instead of creating duplicates. Include scope, prerequisites, steps, verification, rollback or escalation guidance, owners, and links to relevant repos, dashboards, alerts, or tickets when available. Do not include secrets, credentials, customer data, speculation, or unverified claims.
-- When WikiJS materially affects the work, summarize pages consulted, internal facts relied on, documentation gaps or conflicts found, and whether WikiJS was updated.
+- Write to WikiJS only when documenting standard processes, procedures, response playbooks, alert guidance, or component context; only after user approval unless explicitly asked.
+- When writing, update existing pages instead of creating duplicates. Follow existing page standards, layout, or templates. Keep content factual, concise, operational, and project-agnostic where possible. Do not include secrets, customer data, or speculation.
+- Do not permanently delete material content. Existing content may be updated, changed, or reworked as appropriate. When content appears obsolete, incorrect, or requested for removal, mark it for removal on the page for human review.
+- When WikiJS materially affects the work, summarize pages consulted, internal facts relied on, documentation gaps or conflicts found.
 ```
 
 This guidance helps Codex:
