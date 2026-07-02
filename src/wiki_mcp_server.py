@@ -23,7 +23,7 @@ import markdown
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.exc import SQLAlchemyError
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 from pydantic import Field
 from pydantic_settings import BaseSettings
 
@@ -53,6 +53,52 @@ class Settings(BaseSettings):
         return self.WIKIJS_TOKEN or self.WIKIJS_API_KEY
 
 settings = Settings()
+
+def normalize_locale(locale: Optional[str] = None) -> str:
+    """Return the requested locale or the configured default."""
+    return locale or os.getenv("WIKIJS_LOCALE", "en")
+
+def normalize_tags(tags: Any) -> List[str]:
+    """Normalize Wiki.js tag shapes across Page and PageListItem results."""
+    if not tags:
+        return []
+    normalized = []
+    for tag in tags:
+        if isinstance(tag, dict):
+            tag_value = tag.get("tag")
+        else:
+            tag_value = tag
+        if tag_value:
+            normalized.append(tag_value)
+    return normalized
+
+def response_result_error(prefix: str, response_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a structured error from a Wiki.js mutation responseResult."""
+    return {
+        "error": f"{prefix}: {response_result.get('message', 'Unknown error')}",
+        "errorCode": response_result.get("errorCode"),
+        "slug": response_result.get("slug")
+    }
+
+class WikiJSConnectionError(Exception):
+    """Transient connection-level Wiki.js failure."""
+
+class WikiJSGraphQLError(Exception):
+    """Non-transient GraphQL error returned by Wiki.js."""
+
+    def __init__(self, errors: List[Dict[str, Any]]):
+        self.errors = errors
+        messages = []
+        for err in errors:
+            message = err.get("message", str(err))
+            code = err.get("extensions", {}).get("exception", {}).get("code")
+            if code:
+                message = f"{message} (code: {code})"
+            messages.append(message)
+        super().__init__("; ".join(messages))
+
+    def has_message(self, text: str) -> bool:
+        return any(text in err.get("message", "") for err in self.errors)
 
 # Setup logging
 logging.basicConfig(
@@ -179,7 +225,11 @@ class WikiJSClient:
                 return False
         return False
     
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    @retry(
+        retry=retry_if_exception_type(WikiJSConnectionError),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10)
+    )
     async def graphql_request(self, query: str, variables: Dict = None) -> Dict:
         """Make GraphQL request to Wiki.js."""
         url = f"{self.base_url}/graphql"
@@ -196,8 +246,7 @@ class WikiJSClient:
             
             # Check for GraphQL errors
             if "errors" in data:
-                error_msg = "; ".join([err.get("message", str(err)) for err in data["errors"]])
-                raise Exception(f"GraphQL error: {error_msg}")
+                raise WikiJSGraphQLError(data["errors"])
             
             return data
         except httpx.HTTPStatusError as e:
@@ -205,12 +254,12 @@ class WikiJSClient:
             raise Exception(f"Wiki.js GraphQL HTTP error {e.response.status_code}: {e.response.text}")
         except httpx.RequestError as e:
             logger.error(f"Wiki.js connection error: {str(e)}")
-            raise Exception(f"Wiki.js connection error: {str(e)}")
+            raise WikiJSConnectionError(f"Wiki.js connection error: {str(e)}")
 
 # Initialize client
 wikijs = WikiJSClient()
 
-async def create_wikijs_page_at_path(title: str, content: str, path: str) -> Dict[str, Any]:
+async def create_wikijs_page_at_path(title: str, content: str, path: str, locale: str = None) -> Dict[str, Any]:
     """Create a Wiki.js page at an explicit path."""
     mutation = """
     mutation($content: String!, $description: String!, $editor: String!, $isPublished: Boolean!, $isPrivate: Boolean!, $locale: String!, $path: String!, $publishEndDate: Date, $publishStartDate: Date, $scriptCss: String, $scriptJs: String, $tags: [String]!, $title: String!) {
@@ -238,7 +287,7 @@ async def create_wikijs_page_at_path(title: str, content: str, path: str) -> Dic
         "editor": "markdown",
         "isPublished": True,
         "isPrivate": False,
-        "locale": "en",
+        "locale": normalize_locale(locale),
         "path": path.strip("/"),
         "publishEndDate": None,
         "publishStartDate": None,
@@ -255,8 +304,48 @@ async def create_wikijs_page_at_path(title: str, content: str, path: str) -> Dic
     if response_result.get("succeeded"):
         return create_result.get("page", {})
 
-    error_msg = response_result.get("message", "Unknown error")
-    raise Exception(f"Failed to create page: {error_msg}")
+    error_details = response_result_error("Failed to create page", response_result)
+    raise Exception(json.dumps(error_details))
+
+async def get_page_metadata_from_list(
+    page_id: int = None,
+    path: str = None,
+    locale: str = None
+) -> Optional[Dict[str, Any]]:
+    """Fetch page metadata through pages.list, which honors read:pages."""
+    list_query = """
+    query($locale: String) {
+        pages {
+            list(locale: $locale) {
+                id
+                path
+                title
+                description
+                contentType
+                isPublished
+                locale
+                createdAt
+                updatedAt
+                tags
+            }
+        }
+    }
+    """
+
+    response = await wikijs.graphql_request(
+        list_query,
+        {"locale": normalize_locale(locale)}
+    )
+    pages = response.get("data", {}).get("pages", {}).get("list", [])
+    normalized_path = path.strip("/") if path else None
+
+    for page in pages:
+        if page_id is not None and page.get("id") == page_id:
+            return page
+        if normalized_path and page.get("path") == normalized_path:
+            return page
+
+    return None
 
 def get_db():
     """Get database session."""
@@ -341,7 +430,7 @@ def extract_code_structure(file_path: str) -> Dict[str, Any]:
 # MCP Tools Implementation
 
 @mcp.tool()
-async def wikijs_create_page(title: str, content: str, space_id: str = "", parent_id: str = "", path: str = "") -> str:
+async def wikijs_create_page(title: str, content: str, space_id: str = "", parent_id: str = "", path: str = "", locale: str = None) -> str:
     """
     Create a new page in Wiki.js with support for hierarchical organization.
     
@@ -351,6 +440,7 @@ async def wikijs_create_page(title: str, content: str, space_id: str = "", paren
         space_id: Space ID (optional, uses default if not provided)
         parent_id: Parent page ID for hierarchical organization (optional)
         path: Explicit page path (optional, overrides generated path)
+        locale: Page locale (optional, defaults to WIKIJS_LOCALE or en)
     
     Returns:
         JSON string with page details: {'pageId': int, 'url': str}
@@ -386,7 +476,7 @@ async def wikijs_create_page(title: str, content: str, space_id: str = "", paren
         else:
             page_path = slugify(title)
 
-        page_data = await create_wikijs_page_at_path(title, content, page_path)
+        page_data = await create_wikijs_page_at_path(title, content, page_path, locale=locale)
         result = {
             "pageId": page_data.get("id"),
             "url": page_data.get("path"),
@@ -432,6 +522,10 @@ async def wikijs_update_page(page_id: int, title: str = None, content: str = Non
                     isPrivate
                     isPublished
                     locale
+                    publishStartDate
+                    publishEndDate
+                    scriptCss
+                    scriptJs
                     tags {
                         tag
                     }
@@ -448,9 +542,9 @@ async def wikijs_update_page(page_id: int, title: str = None, content: str = Non
         
         # GraphQL mutation to update a page
         mutation = """
-        mutation($id: Int!, $content: String!, $description: String!, $editor: String!, $isPrivate: Boolean!, $isPublished: Boolean!, $locale: String!, $path: String!, $scriptCss: String, $scriptJs: String, $tags: [String]!, $title: String!) {
+        mutation($id: Int!, $content: String!, $description: String!, $editor: String!, $isPrivate: Boolean!, $isPublished: Boolean!, $locale: String!, $path: String!, $publishEndDate: Date, $publishStartDate: Date, $scriptCss: String, $scriptJs: String, $tags: [String]!, $title: String!) {
             pages {
-                update(id: $id, content: $content, description: $description, editor: $editor, isPrivate: $isPrivate, isPublished: $isPublished, locale: $locale, path: $path, scriptCss: $scriptCss, scriptJs: $scriptJs, tags: $tags, title: $title) {
+                update(id: $id, content: $content, description: $description, editor: $editor, isPrivate: $isPrivate, isPublished: $isPublished, locale: $locale, path: $path, publishEndDate: $publishEndDate, publishStartDate: $publishStartDate, scriptCss: $scriptCss, scriptJs: $scriptJs, tags: $tags, title: $title) {
                     responseResult {
                         succeeded
                         errorCode
@@ -481,8 +575,10 @@ async def wikijs_update_page(page_id: int, title: str = None, content: str = Non
             "isPublished": current_page.get("isPublished", True),
             "locale": current_page.get("locale", "en"),
             "path": current_page["path"],
-            "scriptCss": "",
-            "scriptJs": "",
+            "publishEndDate": current_page.get("publishEndDate"),
+            "publishStartDate": current_page.get("publishStartDate"),
+            "scriptCss": current_page.get("scriptCss") or "",
+            "scriptJs": current_page.get("scriptJs") or "",
             "tags": [tag["tag"] for tag in current_page.get("tags", [])],
             "title": new_title
         }
@@ -503,8 +599,7 @@ async def wikijs_update_page(page_id: int, title: str = None, content: str = Non
             logger.info(f"Updated page ID: {page_id}")
             return json.dumps(result)
         else:
-            error_msg = response_result.get("message", "Unknown error")
-            return json.dumps({"error": f"Failed to update page: {error_msg}"})
+            return json.dumps(response_result_error("Failed to update page", response_result))
         
     except Exception as e:
         error_msg = f"Failed to update page {page_id}: {str(e)}"
@@ -512,76 +607,97 @@ async def wikijs_update_page(page_id: int, title: str = None, content: str = Non
         return json.dumps({"error": error_msg})
 
 @mcp.tool()
-async def wikijs_get_page(page_id: int = None, slug: str = None) -> str:
+async def wikijs_get_page(
+    page_id: int = None,
+    slug: str = None,
+    locale: str = None,
+    include_content: bool = True
+) -> str:
     """
     Retrieve page metadata and content from Wiki.js.
     
     Args:
         page_id: Page ID (optional)
         slug: Page slug/path (optional)
+        locale: Page locale (optional, defaults to WIKIJS_LOCALE or en)
+        include_content: Include source content when permissions allow it
     
     Returns:
         JSON string with page data
     """
     try:
         await wikijs.authenticate()
-        
-        if page_id:
-            query = """
-            query($id: Int!) {
-                pages {
-                    single(id: $id) {
-                        id
-                        path
-                        title
-                        content
-                        description
-                        isPrivate
-                        isPublished
-                        locale
-                        createdAt
-                        updatedAt
-                        tags {
-                            tag
-                        }
-                    }
-                }
-            }
-            """
-            variables = {"id": page_id}
-        elif slug:
-            query = """
-            query($path: String!) {
-                pages {
-                    singleByPath(path: $path, locale: "en") {
-                        id
-                        path
-                        title
-                        content
-                        description
-                        isPrivate
-                        isPublished
-                        locale
-                        createdAt
-                        updatedAt
-                        tags {
-                            tag
-                        }
-                    }
-                }
-            }
-            """
-            variables = {"path": slug}
-        else:
-            return json.dumps({"error": "Either page_id or slug must be provided"})
-        
-        response = await wikijs.graphql_request(query, variables)
-        
+
         page_data = None
-        if page_id:
-            page_data = response.get("data", {}).get("pages", {}).get("single")
-        else:
-            page_data = response.get("data", {}).get("pages", {}).get("singleByPath")
+        content_error = None
+        page_locale = normalize_locale(locale)
+
+        if not page_id and not slug:
+            return json.dumps({"error": "Either page_id or slug must be provided"})
+
+        if include_content:
+            try:
+                if page_id:
+                    query = """
+                    query($id: Int!) {
+                        pages {
+                            single(id: $id) {
+                                id
+                                path
+                                title
+                                content
+                                description
+                                contentType
+                                isPublished
+                                locale
+                                createdAt
+                                updatedAt
+                                tags {
+                                    tag
+                                }
+                            }
+                        }
+                    }
+                    """
+                    response = await wikijs.graphql_request(query, {"id": page_id})
+                    page_data = response.get("data", {}).get("pages", {}).get("single")
+                else:
+                    query = """
+                    query($path: String!, $locale: String!) {
+                        pages {
+                            singleByPath(path: $path, locale: $locale) {
+                                id
+                                path
+                                title
+                                content
+                                description
+                                contentType
+                                isPublished
+                                locale
+                                createdAt
+                                updatedAt
+                                tags {
+                                    tag
+                                }
+                            }
+                        }
+                    }
+                    """
+                    response = await wikijs.graphql_request(
+                        query,
+                        {"path": slug.strip("/"), "locale": page_locale}
+                    )
+                    page_data = response.get("data", {}).get("pages", {}).get("singleByPath")
+            except WikiJSGraphQLError as e:
+                content_error = str(e)
+                page_data = None
+
+        if not page_data:
+            page_data = await get_page_metadata_from_list(
+                page_id=page_id,
+                path=slug,
+                locale=page_locale
+            )
         
         if not page_data:
             return json.dumps({"error": "Page not found"})
@@ -590,13 +706,18 @@ async def wikijs_get_page(page_id: int = None, slug: str = None) -> str:
             "pageId": page_data.get("id"),
             "title": page_data.get("title"),
             "content": page_data.get("content"),
-            "contentType": "markdown",
+            "contentType": page_data.get("contentType", "markdown"),
             "lastModified": page_data.get("updatedAt"),
             "path": page_data.get("path"),
             "isPublished": page_data.get("isPublished"),
             "description": page_data.get("description"),
-            "tags": [tag["tag"] for tag in page_data.get("tags", [])]
+            "tags": normalize_tags(page_data.get("tags", [])),
+            "locale": page_data.get("locale"),
+            "contentAvailable": page_data.get("content") is not None
         }
+
+        if content_error:
+            result["contentError"] = content_error
         
         return json.dumps(result)
         
@@ -606,13 +727,14 @@ async def wikijs_get_page(page_id: int = None, slug: str = None) -> str:
         return json.dumps({"error": error_msg})
 
 @mcp.tool()
-async def wikijs_search_pages(query: str, space_id: str = None) -> str:
+async def wikijs_search_pages(query: str, space_id: str = None, locale: str = None) -> str:
     """
     Search pages by text in Wiki.js.
     
     Args:
         query: Search query
         space_id: Space ID to limit search (optional)
+        locale: Search locale (optional, defaults to WIKIJS_LOCALE or en)
     
     Returns:
         JSON string with search results
@@ -622,9 +744,9 @@ async def wikijs_search_pages(query: str, space_id: str = None) -> str:
         
         # GraphQL query for search (fixed - removed invalid suggestions subfields)
         search_query = """
-        query($query: String!) {
+        query($query: String!, $locale: String!) {
             pages {
-                search(query: $query, path: "", locale: "en") {
+                search(query: $query, path: "", locale: $locale) {
                     results {
                         id
                         title
@@ -638,7 +760,7 @@ async def wikijs_search_pages(query: str, space_id: str = None) -> str:
         }
         """
         
-        variables = {"query": query}
+        variables = {"query": query, "locale": normalize_locale(locale)}
         
         response = await wikijs.graphql_request(search_query, variables)
         
@@ -665,12 +787,12 @@ async def wikijs_search_pages(query: str, space_id: str = None) -> str:
         return json.dumps({"error": error_msg})
 
 @mcp.tool()
-async def wikijs_list_spaces() -> str:
+async def wikijs_list_spaces(locale: str = None) -> str:
     """
     List all spaces (top-level Wiki.js containers).
     Note: Wiki.js doesn't have "spaces" like BookStack, but we can list pages at root level.
     
-    Returns:
+        Returns:
         JSON string with spaces list
     """
     try:
@@ -678,9 +800,9 @@ async def wikijs_list_spaces() -> str:
         
         # Get all pages and group by top-level paths
         query = """
-        query {
+        query($locale: String) {
             pages {
-                list {
+                list(locale: $locale) {
                     id
                     title
                     path
@@ -692,7 +814,7 @@ async def wikijs_list_spaces() -> str:
         }
         """
         
-        response = await wikijs.graphql_request(query)
+        response = await wikijs.graphql_request(query, {"locale": normalize_locale(locale)})
         
         pages = response.get("data", {}).get("pages", {}).get("list", [])
         
@@ -1269,7 +1391,7 @@ This is the {section.lower()} section for {repo_name}.
         return json.dumps({"error": error_msg})
 
 @mcp.tool()
-async def wikijs_create_nested_page(title: str, content: str, parent_path: str, create_parent_if_missing: bool = True) -> str:
+async def wikijs_create_nested_page(title: str, content: str, parent_path: str, create_parent_if_missing: bool = True, locale: str = None) -> str:
     """
     Create a nested page using hierarchical paths (e.g., "repo/api/endpoints").
     
@@ -1279,6 +1401,7 @@ async def wikijs_create_nested_page(title: str, content: str, parent_path: str, 
         parent_path: Full path to parent (e.g., "my-repo/api")
         create_parent_if_missing: Kept for compatibility. Wiki.js supports
             virtual parent paths, so missing parent pages are not materialized.
+        locale: Page locale (optional, defaults to WIKIJS_LOCALE or en)
     
     Returns:
         JSON string with page details
@@ -1290,7 +1413,7 @@ async def wikijs_create_nested_page(title: str, content: str, parent_path: str, 
 
         # Create the target page at the explicit path. Wiki.js supports virtual
         # hierarchy containers, so parent_path does not need to be a real page.
-        result = await wikijs_create_page(title, content, path=full_path)
+        result = await wikijs_create_page(title, content, path=full_path, locale=locale)
         result_data = json.loads(result)
         
         if "error" not in result_data:
@@ -1306,13 +1429,14 @@ async def wikijs_create_nested_page(title: str, content: str, parent_path: str, 
         return json.dumps({"error": error_msg})
 
 @mcp.tool()
-async def wikijs_get_page_children(page_id: int = None, page_path: str = None) -> str:
+async def wikijs_get_page_children(page_id: int = None, page_path: str = None, locale: str = None) -> str:
     """
     Get all child pages of a given page for hierarchical navigation.
     
     Args:
         page_id: Parent page ID (optional)
         page_path: Parent page path (optional)
+        locale: Page locale (optional, defaults to WIKIJS_LOCALE or en)
     
     Returns:
         JSON string with child pages list
@@ -1321,6 +1445,7 @@ async def wikijs_get_page_children(page_id: int = None, page_path: str = None) -
         await wikijs.authenticate()
         
         # Get the parent page first
+        page_locale = normalize_locale(locale)
         if page_id:
             parent_query = """
             query($id: Int!) {
@@ -1336,32 +1461,23 @@ async def wikijs_get_page_children(page_id: int = None, page_path: str = None) -
             parent_response = await wikijs.graphql_request(parent_query, {"id": page_id})
             parent_data = parent_response.get("data", {}).get("pages", {}).get("single")
         elif page_path:
-            parent_query = """
-            query($path: String!) {
-                pages {
-                    singleByPath(path: $path, locale: "en") {
-                        id
-                        path
-                        title
-                    }
-                }
-            }
-            """
-            parent_response = await wikijs.graphql_request(parent_query, {"path": page_path})
-            parent_data = parent_response.get("data", {}).get("pages", {}).get("singleByPath")
+            parent_data = await get_page_metadata_from_list(path=page_path, locale=page_locale)
         else:
             return json.dumps({"error": "Either page_id or page_path must be provided"})
         
         if not parent_data:
-            return json.dumps({"error": "Parent page not found"})
-        
-        parent_path = parent_data["path"]
+            if page_path:
+                parent_path = page_path.strip("/")
+            else:
+                return json.dumps({"error": "Parent page not found"})
+        else:
+            parent_path = parent_data["path"]
         
         # Get all pages and filter for children
         all_pages_query = """
-        query {
+        query($locale: String) {
             pages {
-                list {
+                list(locale: $locale) {
                     id
                     title
                     path
@@ -1373,7 +1489,7 @@ async def wikijs_get_page_children(page_id: int = None, page_path: str = None) -
         }
         """
         
-        response = await wikijs.graphql_request(all_pages_query)
+        response = await wikijs.graphql_request(all_pages_query, {"locale": page_locale})
         all_pages = response.get("data", {}).get("pages", {}).get("list", [])
         
         # Filter for direct children (path starts with parent_path/ but no additional slashes)
@@ -1539,7 +1655,7 @@ async def wikijs_create_documentation_hierarchy(project_name: str, file_mappings
         return json.dumps({"error": error_msg})
 
 @mcp.tool()
-async def wikijs_delete_page(page_id: int = None, page_path: str = None, remove_file_mapping: bool = True) -> str:
+async def wikijs_delete_page(page_id: int = None, page_path: str = None, remove_file_mapping: bool = True, locale: str = None) -> str:
     """
     Delete a specific page from Wiki.js.
     
@@ -1547,6 +1663,7 @@ async def wikijs_delete_page(page_id: int = None, page_path: str = None, remove_
         page_id: Page ID to delete (optional)
         page_path: Page path to delete (optional)
         remove_file_mapping: Also remove file-to-page mapping from local database
+        locale: Page locale (optional, defaults to WIKIJS_LOCALE or en)
     
     Returns:
         JSON string with deletion status
@@ -1570,19 +1687,10 @@ async def wikijs_delete_page(page_id: int = None, page_path: str = None, remove_
             get_response = await wikijs.graphql_request(get_query, {"id": page_id})
             page_data = get_response.get("data", {}).get("pages", {}).get("single")
         elif page_path:
-            get_query = """
-            query($path: String!) {
-                pages {
-                    singleByPath(path: $path, locale: "en") {
-                        id
-                        path
-                        title
-                    }
-                }
-            }
-            """
-            get_response = await wikijs.graphql_request(get_query, {"path": page_path})
-            page_data = get_response.get("data", {}).get("pages", {}).get("singleByPath")
+            page_data = await get_page_metadata_from_list(
+                path=page_path,
+                locale=normalize_locale(locale)
+            )
             if page_data:
                 page_id = page_data["id"]
         else:
@@ -1635,8 +1743,7 @@ async def wikijs_delete_page(page_id: int = None, page_path: str = None, remove_
             logger.info(f"Deleted page: {page_data['title']} (ID: {page_id})")
             return json.dumps(result)
         else:
-            error_msg = response_result.get("message", "Unknown error")
-            return json.dumps({"error": f"Failed to delete page: {error_msg}"})
+            return json.dumps(response_result_error("Failed to delete page", response_result))
         
     except Exception as e:
         error_msg = f"Failed to delete page: {str(e)}"
@@ -1649,7 +1756,8 @@ async def wikijs_batch_delete_pages(
     page_paths: List[str] = None,
     path_pattern: str = None,
     confirm_deletion: bool = False,
-    remove_file_mappings: bool = True
+    remove_file_mappings: bool = True,
+    locale: str = None
 ) -> str:
     """
     Batch delete multiple pages from Wiki.js.
@@ -1660,6 +1768,7 @@ async def wikijs_batch_delete_pages(
         path_pattern: Pattern to match paths (e.g., "frontend-app/*" for all pages under frontend-app)
         confirm_deletion: Must be True to actually delete pages (safety check)
         remove_file_mappings: Also remove file-to-page mappings from local database
+        locale: Page locale (optional, defaults to WIKIJS_LOCALE or en)
     
     Returns:
         JSON string with batch deletion results
@@ -1672,6 +1781,7 @@ async def wikijs_batch_delete_pages(
             })
         
         await wikijs.authenticate()
+        page_locale = normalize_locale(locale)
         
         pages_to_delete = []
         
@@ -1697,19 +1807,10 @@ async def wikijs_batch_delete_pages(
         # Collect pages by paths
         if page_paths:
             for page_path in page_paths:
-                get_query = """
-                query($path: String!) {
-                    pages {
-                        singleByPath(path: $path, locale: "en") {
-                            id
-                            path
-                            title
-                        }
-                    }
-                }
-                """
-                get_response = await wikijs.graphql_request(get_query, {"path": page_path})
-                page_data = get_response.get("data", {}).get("pages", {}).get("singleByPath")
+                page_data = await get_page_metadata_from_list(
+                    path=page_path,
+                    locale=page_locale
+                )
                 if page_data:
                     pages_to_delete.append(page_data)
         
@@ -1717,9 +1818,9 @@ async def wikijs_batch_delete_pages(
         if path_pattern:
             # Get all pages and filter by pattern
             all_pages_query = """
-            query {
+            query($locale: String) {
                 pages {
-                    list {
+                    list(locale: $locale) {
                         id
                         title
                         path
@@ -1728,7 +1829,7 @@ async def wikijs_batch_delete_pages(
             }
             """
             
-            response = await wikijs.graphql_request(all_pages_query)
+            response = await wikijs.graphql_request(all_pages_query, {"locale": page_locale})
             all_pages = response.get("data", {}).get("pages", {}).get("list", [])
             
             # Simple pattern matching (supports * wildcard)
@@ -1754,7 +1855,8 @@ async def wikijs_batch_delete_pages(
             try:
                 delete_result = await wikijs_delete_page(
                     page_id=page["id"], 
-                    remove_file_mapping=remove_file_mappings
+                    remove_file_mapping=remove_file_mappings,
+                    locale=page_locale
                 )
                 delete_data = json.loads(delete_result)
                 
