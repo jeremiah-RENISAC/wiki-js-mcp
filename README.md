@@ -53,13 +53,15 @@ Restart Codex or start a new session after updating the config. In the Codex CLI
 Add this guidance to `~/.codex/AGENTS.md` for a global default, or to an `AGENTS.md` file in a repository where this workflow should apply:
 
 ```
-Before writing any code, always:
-1. Search existing documentation using wikijs_search_pages to understand current patterns and architecture
-2. Check for related components, functions, or modules that might already exist
-3. If documentation exists for similar functionality, follow the established patterns and naming conventions
-4. If no documentation exists, create it using wikijs_create_page or wikijs_create_nested_page before implementing
-5. Always update documentation when making changes using wikijs_sync_file_docs
-6. For new features, use wikijs_create_repo_structure to plan the documentation hierarchy first
+# ~/.codex/AGENTS.md
+
+## WikiJS MCP usage
+- Use WikiJS only when work depends on internal context: services, environments, deployments, operations, alerts, runbooks, ownership, or internal conventions. Use repository files for current code behavior and public/vendor docs for external APIs, frameworks, packages, and advisories.
+- Before making environment-dependent or operational changes, search WikiJS with relevant project, service, alert, environment, acronym, owner, and runbook terms. Prefer specific service, SOP, alert, runbook, incident, or architecture pages over broad overview pages.
+- Treat WikiJS as internal context that may be stale. If WikiJS conflicts with the repo, observed behavior, or public/vendor docs, rely on the source that owns that fact and mention the conflict.
+- Write to WikiJS only when documenting standard processes, runbooks, or alert response guidance; only after user approval unless explicitly asked; and only under paths explicitly approved for write access.
+- When writing, be factual, concise, and operational. Update existing pages instead of creating duplicates. Include scope, prerequisites, steps, verification, rollback or escalation guidance, owners, and links to relevant repos, dashboards, alerts, or tickets when available. Do not include secrets, credentials, customer data, speculation, or unverified claims.
+- When WikiJS materially affects the work, summarize pages consulted, internal facts relied on, documentation gaps or conflicts found, and whether WikiJS was updated.
 ```
 
 This guidance helps Codex:
